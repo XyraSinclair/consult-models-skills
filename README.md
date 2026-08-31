@@ -81,6 +81,26 @@ demand first-principles reasoning and an explicit challenge-to-thesis
 section, compare where the framing shifts rather than only where answers
 agree, and close with your own accept/reject/modify judgment.
 
+## The finishing hook
+
+`hooks/stop-once/` vendors our budgeted-conscientiousness Stop hook from
+[stop-once](https://github.com/XyraSinclair/stop-once), its canonical
+home. When the model tries to end its turn, it gets nudged — a few times,
+never forever — to finish what's obviously in scope before stopping.
+
+It earns its place in a consults repo twice over. A tmux-driven Claude
+child running stop-once finishes its work *before* going idle, so
+`claude-tmux wait` unblocks on a completed answer instead of a trailing
+"next, you could…". And the driving session gets the same treatment after
+a consult lands: the hook is what turns "Oracle said X" into X applied.
+
+Wire both halves in `~/.claude/settings.json` (`stop-once.sh` on `Stop`,
+`budget-reset.sh` on `UserPromptSubmit`); full tuning doctrine in the
+canonical repo. One footgun worth its own line: headless `claude -p`
+returns the *last* text block, which under this hook is the stop-pass
+digest, not the deliverable — any script capturing `claude -p` output
+must set `STOP_ONCE=0`.
+
 ## Credits
 
 - [gemini-cli](https://github.com/google-gemini/gemini-cli) (Google) and
