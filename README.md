@@ -1,9 +1,9 @@
 # consult-models-skills
 
-Three [Claude Code](https://code.claude.com/docs) skills that let a coding
-agent consult other frontier models — a second Claude, Gemini, and Kimi —
-from its own terminal, reliably, with the footgun doctrine we learned by
-running each of them daily.
+Four [Claude Code](https://code.claude.com/docs) skills that let a coding
+agent consult other frontier models — a second Claude, GPT Pro, Gemini,
+and Kimi — from its own terminal, reliably, with the footgun doctrine we
+learned by running each of them daily.
 
 A coding agent gets better when a genuinely different mind reviews its
 hardest calls. But "just shell out to the other CLI" fails in practice:
@@ -28,6 +28,12 @@ operating doctrine an agent needs to drive it well.
   non-persistent agent shells. Plus the review-session doctrine: pin a
   verified premium model, reject silent fallbacks, restart instead of
   nudging a session gone superficial.
+- **oracle** — GPT-5.x Pro through your signed-in ChatGPT Pro web session,
+  in a background Chrome that never steals focus: 10–90-minute Pro runs
+  fire-and-collect while the agent keeps working, with a salvage scraper
+  for answers the CLI's completion detector misses. Vendored verbatim from
+  [quiet-oracle](https://github.com/XyraSinclair/quiet-oracle), its
+  canonical standalone home — the deeper README and footgun map live there.
 - **kimi-consult** — an agentic Kimi K3 consult (1M context, a taste
   profile from outside the Anthropic/OpenAI/Google lineage) through the
   [oh-my-pi](https://www.npmjs.com/package/@oh-my-pi/pi-coding-agent)
@@ -35,10 +41,6 @@ operating doctrine an agent needs to drive it well.
   before you wait on a dead consult, per-project continuation threads,
   automatic small-file attachment, and the SITUATION / QUESTION /
   POINTERS / OUTPUT CONTRACT prompting contract.
-
-The fourth seat — GPT Pro through a background browser that never steals
-focus — lives in its own repo:
-[quiet-oracle](https://github.com/XyraSinclair/quiet-oracle).
 
 ## Install
 
@@ -64,6 +66,8 @@ readable doctrine, the wrappers are plain bash.
 Per seat, only what that seat uses:
 
 - **claude-consult**: `tmux` and a logged-in `claude` CLI.
+- **oracle**: macOS, Google Chrome, Node ≥ 22, and a ChatGPT Pro plan
+  signed into the automation profile once (`oracle-bg.sh --setup-master`).
 - **gemini-consult**: `npm install -g @google/gemini-cli` and a
   `GEMINI_API_KEY` (env, or `~/.config/consult-gemini/env`).
 - **kimi-consult**: the `omp` CLI
