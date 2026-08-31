@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# consult-gemini — Gemini CLI with automatic auth sourcing and read-only default.
+#
+# Sources GEMINI_API_KEY from $GEMINI_ENV_FILE (default
+# ~/.config/consult-gemini/env, a `KEY=value` file) when the key is not
+# already in the environment, and defaults to --approval-mode plan so a
+# consult can never write unless you explicitly allow it.
+#
+# Skill doc: ../SKILL.md
+set -euo pipefail
+
+ENV_FILE="${GEMINI_ENV_FILE:-$HOME/.config/consult-gemini/env}"
+
+if [[ -z "${GEMINI_API_KEY:-}" && -f "$ENV_FILE" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+  set +a
+fi
+
+if [[ -z "${GEMINI_API_KEY:-}" ]]; then
+  echo "Missing GEMINI_API_KEY. Expected it in env or $ENV_FILE" >&2
+  exit 2
+fi
+
+HAS_APPROVAL=0
+for a in "$@"; do
+  case "$a" in
+    --approval-mode|--yolo|-s|--sandbox)
+      HAS_APPROVAL=1
+      ;;
+  esac
+done
+
+ARGS=()
+if [[ "$HAS_APPROVAL" -eq 0 ]]; then
+  ARGS+=(--approval-mode plan)
+fi
+
+exec gemini "${ARGS[@]}" "$@"

@@ -1,0 +1,277 @@
+#!/bin/bash
+# kimi-omp — Kimi via oh-my-pi (OMP), tuned for exploratory codebase work.
+#
+# Usage:
+#   kimi-omp "question"                # exploratory, headless (default)
+#   kimi-omp -w "question"             # allow edits/writes
+#   kimi-omp -i "question"             # interactive
+#   kimi-omp --thinking high "..."     # stronger reasoning
+#   kimi-omp -c "follow-up"            # continue last session
+#
+# All other flags are passed through to `omp`.
+
+set -euo pipefail
+
+load_openrouter_from_env_file() {
+  local file="$1"
+  local line
+
+  [[ -f "$file" ]] || return 1
+  line="$(grep -E '^(export[[:space:]]+)?OPENROUTER_API_KEY=' "$file" 2>/dev/null | tail -n 1 || true)"
+  [[ -n "$line" ]] || return 1
+
+  line="${line#export }"
+  export "$line"
+}
+
+openrouter_key_is_valid() {
+  local status
+
+  [[ -n "${OPENROUTER_API_KEY:-}" ]] || return 1
+  if ! command -v curl >/dev/null 2>&1; then
+    return 0
+  fi
+
+  status="$(curl -sS -o /dev/null -w '%{http_code}' \
+    --max-time "${KIMI_OPENROUTER_KEY_CHECK_TIMEOUT:-8}" \
+    -H "Authorization: Bearer ${OPENROUTER_API_KEY}" \
+    https://openrouter.ai/api/v1/auth/key 2>/dev/null || true)"
+  [[ "$status" == "200" ]]
+}
+
+load_openrouter_api_key() {
+  if openrouter_key_is_valid; then
+    return 0
+  fi
+
+  load_openrouter_from_env_file "${KIMI_OPENROUTER_ENV_FILE:-$HOME/.config/consult-kimi/env}" || true
+  openrouter_key_is_valid
+}
+
+if ! load_openrouter_api_key; then
+  printf '%s\n' "kimi-omp: missing or invalid OPENROUTER_API_KEY. Expected a valid key in env or ${KIMI_OPENROUTER_ENV_FILE:-$HOME/.config/consult-kimi/env}" >&2
+  exit 2
+fi
+
+export PI_CODING_AGENT_DIR="${PI_CODING_AGENT_DIR:-$HOME/.omp-kimi/agent}"
+
+OMP_BIN="${OMP_BIN:-}"
+if [[ -z "$OMP_BIN" ]]; then
+  if command -v omp >/dev/null 2>&1; then
+    OMP_BIN="$(command -v omp)"
+  else
+    OMP_BIN="$HOME/.bun/bin/omp"
+  fi
+fi
+
+if [[ ! -x "$OMP_BIN" ]]; then
+  printf '%s\n' "kimi-omp: omp not found; install @oh-my-pi/pi-coding-agent first." >&2
+  exit 1
+fi
+
+MODEL_DEFAULT="${KIMI_OMP_MODEL:-openrouter/moonshotai/kimi-k3}"
+THINKING_DEFAULT="${KIMI_OMP_THINKING:-low}"
+TOOLS_DEFAULT="read,bash,grep,glob,lsp"
+TOOLS_WRITE="read,bash,edit,write,grep,glob,lsp"
+
+EXTRA_ARGS=()
+INTERACTIVE=false
+WRITE_MODE=false
+HAS_PRINT=false
+HAS_EXPLICIT_MODEL=false
+HAS_EXPLICIT_THINKING=false
+HAS_EXPLICIT_TOOLS=false
+HAS_EXPLICIT_NO_TOOLS=false
+HAS_EXPLICIT_EXTENSIONS=false
+HAS_EXPLICIT_SKILLS=false
+HAS_EXPLICIT_RULES=false
+
+project_root() {
+  local cwd
+  cwd="$(pwd -P)"
+  git -C "$cwd" rev-parse --show-toplevel 2>/dev/null || printf '%s\n' "$cwd"
+}
+
+build_system_prompt() {
+  local root="$1"
+
+  cat <<EOF
+You are Kimi running through oh-my-pi as an exploratory coding agent.
+Project root is $root.
+
+If the user supplies labeled context such as SITUATION, PRIOR WORK, QUESTION, POINTERS, STOP CONDITION, KNOWN FACTS, CONSTRAINTS, or OUTPUT CONTRACT, treat those fields as authoritative.
+
+Default workflow:
+1. Search narrowly first with grep/find/lsp.
+2. Read only the slices you need.
+3. Honor STOP CONDITION aggressively and stop the moment you have enough evidence.
+4. Return a visible final answer, not just reasoning.
+
+For large files, do not dump the file. Grep first, then read narrow windows.
+Stay inside the requested scope unless the prompt explicitly asks for broader exploration.
+When POINTERS are provided, treat them as the default search boundary.
+Do not use internet or planning tools unless the user explicitly asks for them.
+Prefer one narrow pass across pointed files over repeated exploratory loops.
+Prefer exact file-grounded claims over pattern analogies.
+If the user requests a precise symbol or canonical object name, return it directly.
+If the prompt is underspecified, make a compact best-effort pass rather than wandering.
+End with a short "Files read:" line when you inspected repo files.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -w|--write)
+      WRITE_MODE=true
+      shift
+      ;;
+    -i|--interactive)
+      INTERACTIVE=true
+      shift
+      ;;
+    -p|--print)
+      HAS_PRINT=true
+      EXTRA_ARGS+=("$1")
+      shift
+      ;;
+    --thinking)
+      HAS_EXPLICIT_THINKING=true
+      EXTRA_ARGS+=("$1")
+      if [[ $# -gt 1 ]]; then
+        EXTRA_ARGS+=("$2")
+        shift 2
+      else
+        shift
+      fi
+      ;;
+    --thinking=*)
+      HAS_EXPLICIT_THINKING=true
+      EXTRA_ARGS+=("$1")
+      shift
+      ;;
+    --model)
+      HAS_EXPLICIT_MODEL=true
+      EXTRA_ARGS+=("$1")
+      if [[ $# -gt 1 ]]; then
+        EXTRA_ARGS+=("$2")
+        shift 2
+      else
+        shift
+      fi
+      ;;
+    --model=*)
+      HAS_EXPLICIT_MODEL=true
+      EXTRA_ARGS+=("$1")
+      shift
+      ;;
+    --tools)
+      HAS_EXPLICIT_TOOLS=true
+      EXTRA_ARGS+=("$1")
+      if [[ $# -gt 1 ]]; then
+        EXTRA_ARGS+=("$2")
+        shift 2
+      else
+        shift
+      fi
+      ;;
+    --tools=*)
+      HAS_EXPLICIT_TOOLS=true
+      EXTRA_ARGS+=("$1")
+      shift
+      ;;
+    --no-tools)
+      HAS_EXPLICIT_NO_TOOLS=true
+      EXTRA_ARGS+=("$1")
+      shift
+      ;;
+    -e|--extension|--hook)
+      HAS_EXPLICIT_EXTENSIONS=true
+      EXTRA_ARGS+=("$1")
+      if [[ $# -gt 1 ]]; then
+        EXTRA_ARGS+=("$2")
+        shift 2
+      else
+        shift
+      fi
+      ;;
+    --extension=*|--hook=*)
+      HAS_EXPLICIT_EXTENSIONS=true
+      EXTRA_ARGS+=("$1")
+      shift
+      ;;
+    --no-extensions)
+      HAS_EXPLICIT_EXTENSIONS=true
+      EXTRA_ARGS+=("$1")
+      shift
+      ;;
+    --skills)
+      HAS_EXPLICIT_SKILLS=true
+      EXTRA_ARGS+=("$1")
+      if [[ $# -gt 1 ]]; then
+        EXTRA_ARGS+=("$2")
+        shift 2
+      else
+        shift
+      fi
+      ;;
+    --skills=*)
+      HAS_EXPLICIT_SKILLS=true
+      EXTRA_ARGS+=("$1")
+      shift
+      ;;
+    --no-skills)
+      HAS_EXPLICIT_SKILLS=true
+      EXTRA_ARGS+=("$1")
+      shift
+      ;;
+    --no-rules)
+      HAS_EXPLICIT_RULES=true
+      EXTRA_ARGS+=("$1")
+      shift
+      ;;
+    *)
+      EXTRA_ARGS+=("$1")
+      shift
+      ;;
+  esac
+done
+
+if [[ "$HAS_PRINT" == false && "$INTERACTIVE" == false && ${#EXTRA_ARGS[@]} -gt 0 ]]; then
+  last_idx=$(( ${#EXTRA_ARGS[@]} - 1 ))
+  last="${EXTRA_ARGS[$last_idx]}"
+  if [[ "$last" != -* ]]; then
+    unset 'EXTRA_ARGS['"$last_idx"']'
+    EXTRA_ARGS+=(-p "$last")
+  fi
+fi
+
+ROOT="$(project_root)"
+SYSTEM_PROMPT="$(build_system_prompt "$ROOT")"
+
+CMD=("$OMP_BIN")
+if [[ "$HAS_EXPLICIT_MODEL" == false ]]; then
+  CMD+=(--model "$MODEL_DEFAULT")
+fi
+if [[ "$HAS_EXPLICIT_THINKING" == false ]]; then
+  CMD+=(--thinking "$THINKING_DEFAULT")
+fi
+if [[ "$HAS_EXPLICIT_NO_TOOLS" == false && "$HAS_EXPLICIT_TOOLS" == false ]]; then
+  if [[ "$WRITE_MODE" == true ]]; then
+    CMD+=(--tools "$TOOLS_WRITE")
+  else
+    CMD+=(--tools "$TOOLS_DEFAULT")
+  fi
+fi
+if [[ "$HAS_EXPLICIT_EXTENSIONS" == false ]]; then
+  CMD+=(--no-extensions)
+fi
+if [[ "$HAS_EXPLICIT_SKILLS" == false ]]; then
+  CMD+=(--no-skills)
+fi
+if [[ "$HAS_EXPLICIT_RULES" == false ]]; then
+  CMD+=(--no-rules)
+fi
+CMD+=(--append-system-prompt "$SYSTEM_PROMPT")
+CMD+=("${EXTRA_ARGS[@]}")
+
+exec "${CMD[@]}"

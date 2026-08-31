@@ -1,0 +1,423 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+project_root() {
+  local cwd
+  cwd="$(pwd -P)"
+  git -C "$cwd" rev-parse --show-toplevel 2>/dev/null || printf '%s\n' "$cwd"
+}
+
+project_session_key() {
+  local root="$1"
+  printf '%s' "$root" | sed -e 's|^/||' -e 's|[^A-Za-z0-9._-]|-|g'
+}
+
+session_root() {
+  local root
+  local agent_home
+  root="$(project_root)"
+  agent_home="${PI_CODING_AGENT_DIR:-$HOME/.omp-kimi/agent}"
+  printf '%s/sessions/%s/%s\n' \
+    "${KIMI_CONSULT_STATE_DIR:-$HOME/.consult-kimi}" \
+    "$(project_session_key "$root")" \
+    "$(project_session_key "$agent_home")"
+}
+
+latest_transcript_path() {
+  printf '%s/latest_transcript.txt\n' "$(session_root)"
+}
+
+arg_present() {
+  local needle="$1"
+  local existing
+
+  for existing in "${ARGS[@]}"; do
+    if [[ "$existing" == "$needle" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+insert_arg_before_prompt() {
+  local value="$1"
+  local before=()
+  local after=()
+
+  before=("${ARGS[@]:0:$PROMPT_ARG_INDEX}")
+  after=("${ARGS[@]:$PROMPT_ARG_INDEX}")
+  ARGS=()
+  if ((${#before[@]} > 0)); then
+    ARGS+=("${before[@]}")
+  fi
+  ARGS+=("$value")
+  if ((${#after[@]} > 0)); then
+    ARGS+=("${after[@]}")
+  fi
+  PROMPT_ARG_INDEX=$((PROMPT_ARG_INDEX + 1))
+}
+
+attach_small_prompt_files() {
+  local prompt="$1"
+  local max_bytes="${KIMI_CONSULT_AUTO_CONTEXT_MAX_BYTES:-200000}"
+  local candidate
+  local cleaned
+  local size
+  local attach
+
+  [[ -n "$prompt" ]] || return 0
+
+  while IFS= read -r candidate; do
+    cleaned="${candidate//\`/}"
+    cleaned="${cleaned%,}"
+    cleaned="${cleaned%.}"
+    cleaned="${cleaned%;}"
+    cleaned="${cleaned%:}"
+    cleaned="${cleaned%\)}"
+    cleaned="${cleaned%\]}"
+    cleaned="${cleaned#./}"
+
+    [[ -f "$cleaned" ]] || continue
+    size="$(wc -c <"$cleaned" | tr -d ' ')"
+    (( size <= max_bytes )) || continue
+
+    attach="@$cleaned"
+    if ! arg_present "$attach"; then
+      insert_arg_before_prompt "$attach"
+    fi
+  done < <(printf '%s\n' "$prompt" | grep -Eo '([A-Za-z0-9_.+-]+/)+[A-Za-z0-9_.+-]+\.[A-Za-z0-9_.+-]+' || true)
+}
+
+build_continue_prompt() {
+  local transcript_file="$1"
+  local user_prompt="$2"
+
+  printf '%s\n' "SITUATION: continue an existing consult-kimi thread."
+  printf '%s\n' "KNOWN FACTS: the transcript below is authoritative prior context from earlier turns in this thread."
+  printf '%s\n' "CONSTRAINTS: answer the newest user message directly; do not claim you lack prior context; do not restate the full transcript unless needed."
+  printf '%s\n\n' "QUESTION: respond to the new user message using the prior thread context."
+  printf '%s\n' "PRIOR TRANSCRIPT:"
+  printf '%s\n' '<<<CONSULT_KIMI_TRANSCRIPT'
+  cat "$transcript_file"
+  printf '\n%s\n' '>>>END_CONSULT_KIMI_TRANSCRIPT'
+  printf '\n%s\n' "NEW USER MESSAGE:"
+  printf '%s\n\n' "$user_prompt"
+  printf '%s\n' "OUTPUT CONTRACT: answer the new user message directly."
+}
+
+trim_transcript_file() {
+  local file="$1"
+  local max_bytes="$2"
+  local size
+  local trimmed
+
+  size="$(wc -c <"$file" | tr -d ' ')"
+  if (( size <= max_bytes )); then
+    return 0
+  fi
+
+  trimmed="$(mktemp "${TMPDIR:-/tmp}/consult-kimi-trim.XXXXXX")"
+  {
+    printf '%s\n' "[consult-kimi trimmed older transcript bytes]"
+    tail -c "$max_bytes" "$file"
+  } >"$trimmed"
+  mv "$trimmed" "$file"
+}
+
+write_transcript() {
+  local transcript_file="$1"
+  local prior_transcript_file="$2"
+  local user_prompt="$3"
+  local assistant_output="$4"
+  local max_bytes="${KIMI_CONSULT_MAX_TRANSCRIPT_BYTES:-250000}"
+  local session_dir
+  local tmp
+
+  session_dir="$(dirname "$transcript_file")"
+  mkdir -p "$session_dir"
+  tmp="$(mktemp "${TMPDIR:-/tmp}/consult-kimi-session.XXXXXX")"
+
+  {
+    if [[ -n "$prior_transcript_file" && -f "$prior_transcript_file" ]]; then
+      cat "$prior_transcript_file"
+      printf '\n'
+    fi
+    printf '%s\n' "User:"
+    printf '%s\n\n' "$user_prompt"
+    printf '%s\n' "Assistant:"
+    printf '%s\n' "$assistant_output"
+  } >"$tmp"
+
+  trim_transcript_file "$tmp" "$max_bytes"
+  mv "$tmp" "$transcript_file"
+}
+
+load_openrouter_from_env_file() {
+  local file="$1"
+  local line
+
+  [[ -f "$file" ]] || return 1
+  line="$(grep -E '^(export[[:space:]]+)?OPENROUTER_API_KEY=' "$file" 2>/dev/null | tail -n 1 || true)"
+  [[ -n "$line" ]] || return 1
+
+  line="${line#export }"
+  export "$line"
+}
+
+openrouter_key_is_valid() {
+  local body status
+
+  [[ -n "${OPENROUTER_API_KEY:-}" ]] || return 1
+  if ! command -v curl >/dev/null 2>&1; then
+    return 0
+  fi
+
+  body="$(mktemp)"
+  status="$(curl -sS -o "$body" -w '%{http_code}' \
+    --max-time "${KIMI_OPENROUTER_KEY_CHECK_TIMEOUT:-8}" \
+    -H "Authorization: Bearer ${OPENROUTER_API_KEY}" \
+    https://openrouter.ai/api/v1/auth/key 2>/dev/null || true)"
+  if [[ "$status" != "200" ]]; then
+    rm -f "$body"
+    return 1
+  fi
+  # A key past its spend limit still returns 200 here but 403s on completions.
+  # Treat limit_remaining <= 0 (when a limit is set) as invalid so we fail before the consult.
+  if command -v python3 >/dev/null 2>&1; then
+    if ! python3 - "$body" <<'PYEOF'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))["data"]
+except Exception:
+    sys.exit(0)  # unparseable body: keep legacy 200-means-valid behavior
+limit = d.get("limit")
+remaining = d.get("limit_remaining")
+if limit is not None and remaining is not None and remaining <= 0:
+    sys.exit(1)
+sys.exit(0)
+PYEOF
+    then
+      rm -f "$body"
+      return 1
+    fi
+  fi
+  rm -f "$body"
+  return 0
+}
+
+load_openrouter_api_key() {
+  if openrouter_key_is_valid; then
+    return 0
+  fi
+
+  load_openrouter_from_env_file "${KIMI_OPENROUTER_ENV_FILE:-$HOME/.config/consult-kimi/env}" || true
+  openrouter_key_is_valid
+}
+
+if ! load_openrouter_api_key; then
+  echo "Missing or invalid OPENROUTER_API_KEY. Expected a valid key in env or ${KIMI_OPENROUTER_ENV_FILE:-$HOME/.config/consult-kimi/env}" >&2
+  exit 2
+fi
+
+# Resolve the real script dir through any symlink, so the sibling kimi-omp
+# is found even when consult-kimi is symlinked onto PATH.
+SCRIPT_SRC="${BASH_SOURCE[0]}"
+while [[ -L "$SCRIPT_SRC" ]]; do
+  SCRIPT_DIR="$(cd -P "$(dirname "$SCRIPT_SRC")" >/dev/null 2>&1 && pwd)"
+  SCRIPT_SRC="$(readlink "$SCRIPT_SRC")"
+  [[ "$SCRIPT_SRC" != /* ]] && SCRIPT_SRC="$SCRIPT_DIR/$SCRIPT_SRC"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SCRIPT_SRC")" >/dev/null 2>&1 && pwd)"
+WRAPPER="${KIMI_CONSULT_WRAPPER:-$SCRIPT_DIR/kimi-omp}"
+if [[ ! -x "$WRAPPER" ]]; then
+  echo "Missing kimi-omp wrapper at $WRAPPER" >&2
+  exit 2
+fi
+
+ORIGINAL_ARGC=$#
+
+export KIMI_OMP_MODEL="${KIMI_OMP_MODEL:-${KIMI_CONSULT_MODEL:-openrouter/moonshotai/kimi-k3}}"
+export KIMI_OMP_THINKING="${KIMI_OMP_THINKING:-${KIMI_CONSULT_THINKING:-low}}"
+export PI_CODING_AGENT_DIR="${PI_CODING_AGENT_DIR:-$HOME/.omp-kimi/agent}"
+
+HAS_MODEL=0
+HAS_THINKING=0
+HAS_INTERACTIVE=0
+HAS_EXPLICIT_AGENT_HOME=0
+NO_SESSION=0
+CONTINUE_LATEST=0
+ARGS=()
+PROMPT_FOR_STORAGE=""
+PROMPT_ARG_INDEX=-1
+
+for (( i=1; i<=$#; i++ )); do
+  arg="${!i}"
+  case "$arg" in
+    -m|--model|--model=*)
+      HAS_MODEL=1
+      ;;
+    --thinking|--thinking=*)
+      HAS_THINKING=1
+      ;;
+    -i|--interactive)
+      HAS_INTERACTIVE=1
+      ;;
+    --session-dir|--session-dir=*)
+      HAS_EXPLICIT_AGENT_HOME=1
+      ;;
+  esac
+done
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -c)
+      CONTINUE_LATEST=1
+      shift
+      ;;
+    -r|--resume)
+      if [[ $# -gt 1 && "$2" == "latest" ]]; then
+        CONTINUE_LATEST=1
+        shift 2
+      else
+        ARGS+=("$1")
+        if [[ $# -gt 1 ]]; then
+          ARGS+=("$2")
+          shift 2
+        else
+          shift
+        fi
+      fi
+      ;;
+    --resume=latest)
+      CONTINUE_LATEST=1
+      shift
+      ;;
+    --resume=*)
+      ARGS+=("$1")
+      shift
+      ;;
+    --no-session)
+      NO_SESSION=1
+      ARGS+=("$1")
+      shift
+      ;;
+    -p|--print)
+      if [[ $# -lt 2 ]]; then
+        echo "consult-kimi: $1 requires a prompt argument" >&2
+        exit 2
+      fi
+      ARGS+=("$2")
+      PROMPT_FOR_STORAGE="$2"
+      PROMPT_ARG_INDEX=$(( ${#ARGS[@]} - 1 ))
+      shift 2
+      ;;
+    --print=*)
+      prompt_value="${1#*=}"
+      ARGS+=("$prompt_value")
+      PROMPT_FOR_STORAGE="$prompt_value"
+      PROMPT_ARG_INDEX=$(( ${#ARGS[@]} - 1 ))
+      shift
+      ;;
+    *)
+      ARGS+=("$1")
+      if [[ "$1" != -* ]]; then
+        PROMPT_FOR_STORAGE="$1"
+        PROMPT_ARG_INDEX=$(( ${#ARGS[@]} - 1 ))
+      fi
+      shift
+      ;;
+  esac
+done
+
+TRANSCRIPT_FILE="$(latest_transcript_path)"
+if [[ "$CONTINUE_LATEST" -eq 1 ]]; then
+  if [[ "$NO_SESSION" -eq 1 ]]; then
+    echo "consult-kimi: cannot combine -c/--resume latest with --no-session" >&2
+    exit 2
+  fi
+  if [[ -z "$PROMPT_FOR_STORAGE" || "$PROMPT_ARG_INDEX" -lt 0 ]]; then
+    echo "consult-kimi: -c/--resume latest requires a follow-up prompt" >&2
+    exit 2
+  fi
+  if [[ ! -f "$TRANSCRIPT_FILE" ]]; then
+    echo "consult-kimi: no prior consult-kimi transcript found for this project" >&2
+    exit 2
+  fi
+  REWRITTEN_PROMPT="$(build_continue_prompt "$TRANSCRIPT_FILE" "$PROMPT_FOR_STORAGE")"
+  ARGS[$PROMPT_ARG_INDEX]="$REWRITTEN_PROMPT"
+fi
+
+if [[ "$HAS_INTERACTIVE" -eq 0 && "$PROMPT_ARG_INDEX" -ge 0 ]]; then
+  attach_small_prompt_files "$PROMPT_FOR_STORAGE"
+fi
+
+if [[ "$HAS_MODEL" -eq 0 ]]; then
+  ARGS=(--model "$KIMI_OMP_MODEL" "${ARGS[@]}")
+fi
+if [[ "$HAS_THINKING" -eq 0 ]]; then
+  ARGS=(--thinking "$KIMI_OMP_THINKING" "${ARGS[@]}")
+fi
+
+if [[ "$HAS_INTERACTIVE" -eq 1 ]]; then
+  exec "$WRAPPER" "${ARGS[@]}"
+fi
+
+if [[ "$ORIGINAL_ARGC" -eq 0 ]]; then
+  exec "$WRAPPER" "${ARGS[@]}"
+fi
+
+stdout_file="$(mktemp)"
+stderr_file="$(mktemp)"
+cleanup() {
+  rm -f "$stdout_file" "$stderr_file"
+}
+trap cleanup EXIT
+
+set +e
+"$WRAPPER" "${ARGS[@]}" >"$stdout_file" 2>"$stderr_file"
+status=$?
+set -e
+
+if [[ "$status" -eq 0 ]] && ! grep -q '[^[:space:]]' "$stdout_file"; then
+  retry_stdout_file="$(mktemp)"
+  retry_stderr_file="$(mktemp)"
+  set +e
+  "$WRAPPER" "${ARGS[@]}" >"$retry_stdout_file" 2>"$retry_stderr_file"
+  retry_status=$?
+  set -e
+  if [[ "$retry_status" -eq 0 ]] && grep -q '[^[:space:]]' "$retry_stdout_file"; then
+    mv "$retry_stdout_file" "$stdout_file"
+    mv "$retry_stderr_file" "$stderr_file"
+  else
+    rm -f "$retry_stdout_file" "$retry_stderr_file"
+  fi
+fi
+
+if [[ "$status" -eq 0 ]] && ! grep -q '[^[:space:]]' "$stdout_file"; then
+  printf '%s\n' "consult-kimi: model returned an empty response after retry." >>"$stderr_file"
+  status=1
+fi
+
+if [[ "$status" -eq 0 ]]; then
+  if [[ "$NO_SESSION" -eq 0 && -n "$PROMPT_FOR_STORAGE" ]]; then
+    prior_for_storage=""
+    if [[ "$CONTINUE_LATEST" -eq 1 ]]; then
+      prior_for_storage="$TRANSCRIPT_FILE"
+    fi
+    write_transcript "$TRANSCRIPT_FILE" "$prior_for_storage" "$PROMPT_FOR_STORAGE" "$(cat "$stdout_file")"
+  fi
+  cat "$stderr_file" >&2
+  cat "$stdout_file"
+  exit 0
+fi
+
+if grep -qi "database is locked" "$stderr_file" && [[ "$HAS_EXPLICIT_AGENT_HOME" -eq 0 ]]; then
+  isolated_home="$(mktemp -d "${TMPDIR:-/tmp}/consult-kimi-agent.XXXXXX")"
+  export PI_CODING_AGENT_DIR="$isolated_home/agent"
+  echo "consult-kimi: primary agent home was locked; retrying in isolated agent home." >&2
+  exec "$WRAPPER" "${ARGS[@]}"
+fi
+
+cat "$stderr_file" >&2
+cat "$stdout_file"
+exit "$status"

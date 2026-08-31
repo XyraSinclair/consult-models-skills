@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# claude-tmux — spawn and drive interactive Claude Code sessions in tmux.
+#
+# Billing invariant: the child uses the logged-in Claude subscription (keychain
+# OAuth). ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN are explicitly unset for the
+# child so it can never silently flip to metered API billing.
+#
+# Skill doc: ../SKILL.md
+set -euo pipefail
+
+BUSY_MARKER='esc to interrupt'
+PROMPT_MARKER='❯'
+DEFAULT_TIMEOUT=600
+
+usage() {
+  cat <<'EOF'
+claude-tmux — programmatic interactive Claude Code over tmux (subscription OAuth, no API credits)
+
+  claude-tmux spawn <session> [dir] [extra claude flags...]  start detached session, wait for ready
+  claude-tmux ask   <session> <prompt> [timeout_s]           send prompt, wait until idle, print new output
+  claude-tmux send  <session> <prompt>                       send prompt without waiting
+  claude-tmux wait  <session> [timeout_s]                    block until idle (rc 1 on timeout)
+  claude-tmux read  <session> [lines]                        dump recent scrollback (default 60 lines)
+  claude-tmux ls                                             list tmux sessions
+  claude-tmux kill  <session>                                kill session
+
+Typical: claude-tmux spawn worker ~/repo && claude-tmux ask worker "review foo.rs" 900
+EOF
+}
+
+cap() { tmux capture-pane -t "$1" -p -S "${2:--2000}"; }
+
+# Two UI surfaces since Claude Code 2.1.x (verified 2.1.201): the task
+# dashboard (bare `claude` in a repo) never shows "esc to interrupt" — busy
+# there is a nonzero "N working" header counter. Classic chat view keeps the
+# old marker. Busy iff either matches.
+is_busy() { cap "$1" 0 | grep -Eq "$BUSY_MARKER|[1-9][0-9]* working"; }
+
+do_spawn() {
+  local s=$1; shift
+  local dir=$PWD
+  if [ $# -gt 0 ] && [ -d "$1" ]; then dir=$1; shift; fi
+  local flags=""  # remaining args = extra claude flags
+  for a in "$@"; do flags+=$(printf ' %q' "$a"); done
+  tmux new-session -d -s "$s" -x 220 -y 50 -c "$dir" \
+    "env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN claude$flags"
+  # wait for the input prompt to render (trust dialogs etc. still show ❯-less UI)
+  for _ in $(seq 1 30); do
+    cap "$s" 0 | grep -qF "$PROMPT_MARKER" && { echo "ready: $s"; return 0; }
+    sleep 1
+  done
+  echo "spawned but prompt not detected — inspect with: claude-tmux read $s" >&2
+  return 1
+}
+
+do_send() {
+  local s=$1 prompt=$2
+  tmux send-keys -t "$s" -l "$prompt"
+  sleep 0.4
+  tmux send-keys -t "$s" Enter
+  # Enter-swallow mitigation: if not busy shortly after, and the typed text is
+  # still sitting in the input box, press Enter again once.
+  sleep 2
+  if ! is_busy "$s"; then
+    local needle; needle=$(printf '%s' "$prompt" | head -c 40)
+    if cap "$s" 0 | tail -5 | grep -qF "$needle"; then
+      tmux send-keys -t "$s" Enter
+    fi
+  fi
+}
+
+do_wait() {
+  local s=$1 timeout=${2:-$DEFAULT_TIMEOUT} elapsed=0
+  while [ "$elapsed" -lt "$timeout" ]; do
+    is_busy "$s" || return 0
+    sleep 2; elapsed=$((elapsed + 2))
+  done
+  echo "timeout after ${timeout}s — still working; check: claude-tmux read $s" >&2
+  return 1
+}
+
+do_ask() {
+  local s=$1 prompt=$2 timeout=${3:-$DEFAULT_TIMEOUT}
+  do_send "$s" "$prompt"
+  do_wait "$s" "$timeout"
+  # print from the last echo of the prompt onward; fall back to a tail
+  local needle out
+  needle=$(printf '%s' "$prompt" | head -1 | head -c 60)
+  out=$(cap "$s")
+  local ln
+  ln=$(printf '%s\n' "$out" | grep -nF "$needle" | tail -1 | cut -d: -f1 || true)
+  if [ -n "${ln:-}" ]; then
+    printf '%s\n' "$out" | tail -n "+$ln"
+  else
+    printf '%s\n' "$out" | tail -60
+  fi | grep -v '^$'
+}
+
+cmd=${1:-help}; shift || true
+case "$cmd" in
+  spawn) do_spawn "$@" ;;
+  send)  do_send "$1" "$2" ;;
+  ask)   do_ask "$@" ;;
+  wait)  do_wait "$@" ;;
+  read)  cap "$1" "-${2:-60}" | grep -v '^$' ;;
+  ls)    tmux ls ;;
+  kill)  tmux kill-session -t "$1" ;;
+  help|--help|-h) usage ;;
+  *) usage; exit 1 ;;
+esac
